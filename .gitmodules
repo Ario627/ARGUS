@@ -1,0 +1,12 @@
+[submodule "backend"]
+	path = backend
+	url = https://github.com/Ario627/backendArgus.git
+	branch = main
+[submodule "frontend"]
+	path = frontend
+	url = https://github.com/Ario627/frontendArgus.git
+	branch = main
+[submodule "solver"]
+	path = solver
+	url = https://github.com/Ario627/Argus-python-OR.git
+	branch = main

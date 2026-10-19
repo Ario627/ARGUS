@@ -1,0 +1,195 @@
+name: argus
+
+x-db-env: &db-env
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: ${POSTGRES_DB:-argus}
+  DB_USER: ${POSTGRES_USER:-argus}
+  DB_PASSWORD: ${POSTGRES_PASSWORD:?jalankan cp .env.example .env}
+
+x-backend-env: &backend-env
+  <<: *db-env
+  NODE_ENV: development
+  PORT: "3001"
+  DB_SSL: "false"
+  DB_POOL_SIZE: "10"
+  MIGRATIONS_RUN: "false"
+  LOG_LEVEL: info
+  FRONTEND_URL: http://localhost:${FRONTEND_PORT:-8080}
+  PUBLIC_APP_URL: http://localhost:${FRONTEND_PORT:-8080}
+  PUBLIC_API_URL: http://localhost:${FRONTEND_PORT:-8080}/api/v1
+  JWT_SECRET: ${JWT_SECRET:?}
+  JWT_EXPIRES_IN: 8h
+  BCRYPT_ROUNDS: "12"
+  IP_HASH_SALT: ${IP_HASH_SALT:?}
+  DEVICE_SECRET_ENC_KEY: ${DEVICE_SECRET_ENC_KEY:?}
+  PHOTO_URL_SECRET: ${PHOTO_URL_SECRET:?}
+  PHOTO_SIGNED_URL_TTL_SECONDS: "900"
+  PHOTO_MAX_BYTES: "2097152"
+  STORAGE_DRIVER: filesystem
+  STORAGE_DIR: /app/var/photos
+  MQTT_URL: mqtt://mqtt:1883
+  MQTT_CLIENT_ID: argus-backend
+  MQTT_USERNAME: ""
+  MQTT_PASSWORD: ""
+  OPTIMIZER_URL: http://optimizer:8100
+  OPTIMIZER_TOKEN: ${INTERNAL_SERVICE_TOKEN:?}
+  GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+  MAPBOX_TOKEN: ${MAPBOX_TOKEN:-}
+  OSRM_BASE_URL: ${OSRM_BASE_URL:-https://router.project-osrm.org}
+  ROUTING_TRAFFIC: "true"
+  ROUTING_ALTERNATIVES: "3"
+  DISPATCH_AUTO_ON_CREATE: "true"
+  DISPATCH_MAX_PER_RUN: "8"
+  DEMO_MODE: "true"
+  RETENTION_PURGE_ENABLED: "false"
+  TZ: Asia/Jakarta
+
+services:
+  postgres:
+    image: timescale/timescaledb:2.30.2-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-argus}
+      POSTGRES_USER: ${POSTGRES_USER:-argus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-argus} -d ${POSTGRES_DB:-argus}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - argus
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    command: ["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"]
+    volumes:
+      - ./docker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h 127.0.0.1 -p 1883 -t health -m ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - argus
+
+  optimizer:
+    image: argus-optimizer:local
+    build:
+      context: ./solver
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: development
+      HOST: 0.0.0.0
+      PORT: "8100"
+      MOCK_MODE: "false"
+      LOG_LEVEL: INFO
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?}
+      TZ: Asia/Jakarta
+    expose:
+      - "8100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks:
+      - argus
+
+  migrate:
+    image: argus-backend:local
+    command: ["node", "dist/database/migrate.js", "run"]
+    environment: *db-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - argus
+
+  seed:
+    image: argus-backend:local
+    command: ["node", "dist/database/seed-demo.js"]
+    environment:
+      <<: *db-env
+      NODE_ENV: development
+      BCRYPT_ROUNDS: "12"
+      SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-password123}
+      SEED_DEMO: "true"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    networks:
+      - argus
+
+  seed-users:
+    image: argus-backend:local
+    command: ["node", "seed-demo-users.mjs"]
+    environment:
+      <<: *db-env
+      DEMO_PASSWORD: ${SEED_ADMIN_PASSWORD:-password123}
+    volumes:
+      - ./scripts/seed-demo-users.mjs:/app/seed-demo-users.mjs:ro
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    restart: "no"
+    networks:
+      - argus
+
+  backend:
+    image: argus-backend:local
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment: *backend-env
+    ports:
+      - "${BACKEND_PORT:-3001}:3001"
+    volumes:
+      - photo-data:/app/var/photos
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mqtt:
+        condition: service_healthy
+      optimizer:
+        condition: service_healthy
+      seed-users:
+        condition: service_completed_successfully
+    networks:
+      - argus
+
+  frontend:
+    image: argus-frontend:local
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api/v1
+        VITE_APP_TITLE: ARGUS
+        VITE_DEMO_MODE: "true"
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - argus
+
+volumes:
+  postgres-data:
+  photo-data:
+
+networks:
+  argus:
+    driver: bridge
